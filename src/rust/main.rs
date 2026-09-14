@@ -155,7 +155,7 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
                     Ok(r) => match serde_json::from_slice::<Value>(&r.body) {
                         Ok(v) => (
                             Some(json!({"reachable": true, "status": r.http_status})),
-                            v.get("runtime").cloned(),
+                            v.get("runtime").filter(|r| r.is_object()).cloned(),
                         ),
                         Err(e) => (
                             Some(
