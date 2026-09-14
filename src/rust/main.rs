@@ -148,25 +148,41 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
                 .get("deep")
                 .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false);
-            let worker_ipc = if deep {
-                Some(match worker.health() {
-                    Ok(r) => json!({"reachable": true, "status": r.http_status}),
-                    Err(e) => json!({"reachable": false, "status": 0, "error": e.to_string()}),
-                })
+            // ?deep=1 fetches the worker's health body and merges its runtime
+            // object into the response; plain /health stays worker-independent.
+            let (worker_ipc, runtime) = if deep {
+                match worker.health() {
+                    Ok(r) => match serde_json::from_slice::<Value>(&r.body) {
+                        Ok(v) => (
+                            Some(json!({"reachable": true, "status": r.http_status})),
+                            v.get("runtime").filter(|r| r.is_object()).cloned(),
+                        ),
+                        Err(e) => (
+                            Some(
+                                json!({"reachable": true, "status": r.http_status, "error": e.to_string()}),
+                            ),
+                            None,
+                        ),
+                    },
+                    Err(e) => (
+                        Some(json!({"reachable": false, "status": 0, "error": e.to_string()})),
+                        None,
+                    ),
+                }
             } else {
-                None
+                (None, None)
             };
-            write_json(
-                &mut stream,
-                200,
-                json!({
-                    "status": "ok",
-                    "version": VERSION,
-                    "mode": "rust-supervisor",
-                    "worker": worker.snapshot(),
-                    "worker_ipc": worker_ipc,
-                }),
-            )?;
+            let mut response = json!({
+                "status": "ok",
+                "version": VERSION,
+                "mode": "rust-supervisor",
+                "worker": worker.snapshot(),
+                "worker_ipc": worker_ipc,
+            });
+            if let Some(runtime) = runtime {
+                response["runtime"] = runtime;
+            }
+            write_json(&mut stream, 200, response)?;
         }
         ("GET", "/me") => proxy_json(
             &mut stream,
