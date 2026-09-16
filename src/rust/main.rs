@@ -3,7 +3,7 @@ mod worker;
 
 use std::collections::HashMap;
 use std::env;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
@@ -17,8 +17,11 @@ const DEFAULT_HTTP_HOST: &str = "0.0.0.0";
 const DEFAULT_HTTP_PORT: u16 = 80;
 const DEFAULT_DECRYPT_HOST: &str = "0.0.0.0";
 const DEFAULT_DECRYPT_PORT: u16 = 10020;
+/// Hard cap applied while reading the request head, so a client streaming
+/// bytes without a blank-line terminator cannot buffer without bound.
+const MAX_HTTP_HEAD_BYTES: usize = 64 * 1024;
 /// Bodies are small JSON login/2FA payloads; larger requests are rejected
-/// before allocation, mirroring the 64 KiB header cap enforced below.
+/// before allocation, mirroring the head cap above.
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 
 fn main() {
@@ -88,27 +91,67 @@ fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum HttpHead {
+    Read(Vec<u8>),
+    Eof,
+    TooLarge,
+}
+
+/// Byte index just past the blank line ending the request head, scanning from
+/// `from` so repeated reads need not rescan the whole buffer.
+fn find_head_end(head: &[u8], from: usize) -> Option<usize> {
+    let hay = &head[from..];
+    let crlf = hay
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| from + p + 4);
+    let lf = hay
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|p| from + p + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Reads the request head with a hard byte cap applied on every chunk, so a
+/// client streaming bytes without a blank-line terminator cannot buffer
+/// without bound. The returned buffer may hold body bytes that arrived in the
+/// same read; the caller splits it at the parsed header length.
+fn read_http_head(reader: &mut impl Read) -> io::Result<HttpHead> {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let scanned_from = head.len().saturating_sub(3);
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(HttpHead::Eof);
+        }
+        head.extend_from_slice(&chunk[..n]);
+        if find_head_end(&head, scanned_from).is_some() {
+            return Ok(HttpHead::Read(head));
+        }
+        if head.len() > MAX_HTTP_HEAD_BYTES {
+            return Ok(HttpHead::TooLarge);
+        }
+    }
+}
+
 fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(70)))?;
     stream.set_write_timeout(Some(Duration::from_secs(70)))?;
 
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut head = Vec::new();
-    loop {
-        let mut line = Vec::new();
-        let n = reader.read_until(b'\n', &mut line)?;
-        if n == 0 {
-            return Ok(());
-        }
-        head.extend_from_slice(&line);
-        if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
-            break;
-        }
-        if head.len() > 64 * 1024 {
+    let mut head = match read_http_head(&mut reader)? {
+        HttpHead::Read(head) => head,
+        HttpHead::Eof => return Ok(()),
+        HttpHead::TooLarge => {
             write_json(&mut stream, 431, json!({"error":"headers_too_large"}))?;
             return Ok(());
         }
-    }
+    };
 
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
@@ -119,6 +162,7 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
         write_json(&mut stream, 400, json!({"error":"bad_request"}))?;
         return Ok(());
     }
+    let head_len = parsed.unwrap();
 
     let method = req.method.unwrap_or("").to_string();
     let target = req.path.unwrap_or("/").to_string();
@@ -136,13 +180,19 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
         }
     }
 
-    if content_length > MAX_HTTP_BODY_BYTES {
+    if http_body_too_large(content_length) {
         write_json(&mut stream, 413, json!({"error":"payload_too_large"}))?;
         return Ok(());
     }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
+    // Bytes past the head may already have arrived with it; they count toward
+    // the body, and the remainder is read from the stream below.
+    let mut body = head.split_off(head_len);
+    if body.len() > content_length {
+        body.truncate(content_length);
+    } else if body.len() < content_length {
+        let mut rest = vec![0u8; content_length - body.len()];
+        reader.read_exact(&mut rest)?;
+        body.extend_from_slice(&rest);
     }
 
     let (path, query) = split_target(&target);
@@ -280,6 +330,11 @@ fn hex(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Whether a declared Content-Length exceeds the accepted request body cap.
+fn http_body_too_large(content_length: usize) -> bool {
+    content_length > MAX_HTTP_BODY_BYTES
 }
 
 fn parse_json_body(body: &[u8]) -> io::Result<Value> {
@@ -557,4 +612,67 @@ fn build_decrypt_samples_payload(samples: &[Vec<u8>]) -> io::Result<Vec<u8>> {
         out.extend_from_slice(sample);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_body_cap_boundary() {
+        assert!(!http_body_too_large(MAX_HTTP_BODY_BYTES));
+        assert!(http_body_too_large(MAX_HTTP_BODY_BYTES + 1));
+    }
+
+    /// Reads everything the caller asks for, counting consumed bytes so tests
+    /// can prove the head read stops early.
+    struct CountingReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = (self.data.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn http_head_read_stops_at_cap_without_terminator() {
+        let mut reader = CountingReader {
+            data: vec![b'x'; MAX_HTTP_HEAD_BYTES * 3],
+            pos: 0,
+        };
+        match read_http_head(&mut reader).unwrap() {
+            HttpHead::TooLarge => {}
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        // One chunk may overread past the cap before the check fires; the
+        // old read_until loop would have consumed the whole stream instead.
+        assert!(reader.pos <= MAX_HTTP_HEAD_BYTES + 4096);
+    }
+
+    #[test]
+    fn http_head_read_returns_head_through_blank_line() {
+        let mut reader: &[u8] = b"POST /login HTTP/1.1\r\nhost: x\r\n\r\n{\"a\":1}";
+        match read_http_head(&mut reader).unwrap() {
+            HttpHead::Read(head) => {
+                assert!(head.starts_with(b"POST /login HTTP/1.1"));
+                assert!(head.windows(4).any(|w| w == b"\r\n\r\n"));
+            }
+            other => panic!("expected Read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_head_read_reports_eof_without_terminator() {
+        let mut reader: &[u8] = b"POST /login HTTP/1.1\r\n";
+        match read_http_head(&mut reader).unwrap() {
+            HttpHead::Eof => {}
+            other => panic!("expected Eof, got {other:?}"),
+        }
+    }
 }
