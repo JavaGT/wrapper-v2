@@ -545,6 +545,15 @@ fn parse_decrypt_batch_payload(body: &[u8]) -> io::Result<(String, String, Vec<V
             "empty decrypt batch field",
         ));
     }
+    // Every sample needs a 4-byte length-table entry plus at least one
+    // payload byte inside this frame; reject counts that can never fit
+    // before sizing the vectors below.
+    if sample_count > body.len().saturating_sub(8 + adam_len + uri_len) / 5 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decrypt batch too large",
+        ));
+    }
     let table_end =
         8usize
             .checked_add(sample_count.checked_mul(4).ok_or_else(|| {
@@ -699,5 +708,34 @@ mod tests {
             HttpHead::Eof => {}
             other => panic!("expected Eof, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decrypt_batch_rejects_sample_count_that_cannot_fit() {
+        // The header claims a million samples but the frame has no room for
+        // the length table plus one byte per sample.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1_000_000u32.to_be_bytes());
+        body.extend_from_slice(b"a");
+        body.extend_from_slice(b"u");
+        let err = parse_decrypt_batch_payload(&body).unwrap_err();
+        assert_eq!(err.to_string(), "decrypt batch too large");
+    }
+
+    #[test]
+    fn decrypt_batch_accepts_minimal_sample_count() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&4u32.to_be_bytes());
+        body.extend_from_slice(b"a");
+        body.extend_from_slice(b"u");
+        body.extend_from_slice(b"abcd");
+        let (adam, uri, samples) = parse_decrypt_batch_payload(&body).unwrap();
+        assert_eq!((adam.as_str(), uri.as_str()), ("a", "u"));
+        assert_eq!(samples, vec![b"abcd".to_vec()]);
     }
 }
