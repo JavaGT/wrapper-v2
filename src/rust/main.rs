@@ -23,6 +23,10 @@ const MAX_HTTP_HEAD_BYTES: usize = 64 * 1024;
 /// Bodies are small JSON login/2FA payloads; larger requests are rejected
 /// before allocation, mirroring the head cap above.
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
+/// Unread request bytes discarded from a rejected connection before it is
+/// dropped, so the error response survives instead of being lost to a TCP
+/// reset.
+const REJECT_DRAIN_BYTES: usize = 256 * 1024;
 
 fn main() {
     if let Err(e) = run() {
@@ -149,6 +153,7 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
         HttpHead::Eof => return Ok(()),
         HttpHead::TooLarge => {
             write_json(&mut stream, 431, json!({"error":"headers_too_large"}))?;
+            drain_rejected(&mut stream, REJECT_DRAIN_BYTES);
             return Ok(());
         }
     };
@@ -182,6 +187,7 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
 
     if http_body_too_large(content_length) {
         write_json(&mut stream, 413, json!({"error":"payload_too_large"}))?;
+        drain_rejected(&mut stream, REJECT_DRAIN_BYTES);
         return Ok(());
     }
     // Bytes past the head may already have arrived with it; they count toward
@@ -332,6 +338,24 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
+/// A rejected connection is dropped with unread request data still arriving,
+/// which can make the kernel send a TCP reset that discards the error
+/// response just written. Half-close to flush the response, then discard a
+/// bounded amount of the unread request before dropping the socket.
+fn drain_rejected(stream: &mut TcpStream, max_bytes: usize) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let mut buf = [0u8; 8192];
+    let mut left = max_bytes;
+    while left > 0 {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => left -= n.min(left),
+            Err(_) => break,
+        }
+    }
+}
+
 /// Whether a declared Content-Length exceeds the accepted request body cap.
 fn http_body_too_large(content_length: usize) -> bool {
     content_length > MAX_HTTP_BODY_BYTES
@@ -436,6 +460,7 @@ fn handle_decrypt_client(mut stream: TcpStream, worker: Arc<Worker>) -> io::Resu
                 header.request_id,
                 "decrypt frame too large",
             )?;
+            drain_rejected(&mut stream, REJECT_DRAIN_BYTES);
             return Ok(());
         }
         let payload = match protocol::read_decrypt_payload(&mut stream, header.payload_len) {
