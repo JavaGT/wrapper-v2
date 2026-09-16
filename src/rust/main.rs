@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -27,6 +28,10 @@ const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 /// dropped, so the error response survives instead of being lost to a TCP
 /// reset.
 const REJECT_DRAIN_BYTES: usize = 256 * 1024;
+/// Upper bound on simultaneous client connections per listener; excess
+/// connections are answered with an error and closed instead of spawning
+/// unbounded per-connection threads.
+const MAX_CONNECTIONS_PER_LISTENER: usize = 128;
 
 fn main() {
     if let Err(e) = run() {
@@ -79,14 +84,23 @@ fn worker_io_error(e: WorkerError) -> io::Error {
 fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     eprintln!("wrapperd: {VERSION} HTTP listening on {addr}");
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                if active.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS_PER_LISTENER {
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    let mut stream = stream;
+                    let _ = write_json(&mut stream, 503, json!({"error":"overloaded"}));
+                    continue;
+                }
                 let worker = Arc::clone(&worker);
+                let active = Arc::clone(&active);
                 thread::spawn(move || {
                     if let Err(e) = handle_http_connection(stream, worker) {
                         eprintln!("wrapperd: http connection error: {e}");
                     }
+                    active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(e) => eprintln!("wrapperd: http accept error: {e}"),
@@ -421,14 +435,23 @@ fn write_response(
 fn run_decrypt_tcp(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     eprintln!("wrapperd: {VERSION} TCP decrypt listening on {addr}");
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                if active.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS_PER_LISTENER {
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    let mut stream = stream;
+                    let _ = write_decrypt_error(&mut stream, 0, "server busy");
+                    continue;
+                }
                 let worker = Arc::clone(&worker);
+                let active = Arc::clone(&active);
                 thread::spawn(move || {
                     if let Err(e) = handle_decrypt_client(stream, worker) {
                         eprintln!("wrapperd: decrypt client closed: {e}");
                     }
+                    active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(e) => eprintln!("wrapperd: decrypt accept error: {e}"),
