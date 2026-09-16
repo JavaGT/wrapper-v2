@@ -174,11 +174,24 @@ impl Worker {
         ))
     }
 
+    /// Supervisor budget for one IPC request, counted from when the worker
+    /// lock is acquired (the lock wait itself is bounded by the base budget).
+    /// It must strictly exceed the daemon's own wait for the opcode (see
+    /// kLoginTimeout and kLogin2faTimeout in src/daemon/ipc.cpp), so a slow
+    /// settle is answered instead of timing out and SIGKILLing the worker
+    /// mid-flow.
+    fn request_timeout_for(&self, opcode: u16) -> Duration {
+        match opcode {
+            protocol::OP_LOGIN_2FA => self.request_timeout + LOGIN_2FA_DAEMON_SETTLE,
+            _ => self.request_timeout,
+        }
+    }
+
     fn request(&self, opcode: u16, payload: Vec<u8>) -> Result<protocol::Frame, WorkerError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let deadline = Instant::now() + self.request_timeout;
+        let lock_deadline = Instant::now() + self.request_timeout;
         let wait_tracker = self.track_wait();
-        let mut guard = match lock_worker_timeout(&self.proc, deadline) {
+        let mut guard = match lock_worker_timeout(&self.proc, lock_deadline) {
             Ok(g) => g,
             Err(e) => {
                 if e.to_string().contains("timed out") {
@@ -207,6 +220,11 @@ impl Worker {
         let proc = guard
             .as_mut()
             .ok_or_else(|| WorkerError::Unavailable("worker missing".to_string()))?;
+        // The request budget starts once the worker is exclusively ours, so
+        // the daemon's own wait (e.g. a 60s 2FA settle) always gets the full
+        // per-opcode budget; only the lock wait above shares the base budget.
+        let timeout = self.request_timeout_for(opcode);
+        let deadline = Instant::now() + timeout;
         let req = protocol::Frame {
             kind: protocol::KIND_REQUEST,
             request_id: id,
@@ -218,7 +236,7 @@ impl Worker {
             if e.kind() == io::ErrorKind::TimedOut {
                 eprintln!(
                     "wrapperd: worker request opcode={opcode} timed out while writing after {:?}; restarting worker",
-                    self.request_timeout
+                    timeout
                 );
                 self.timeout_count.fetch_add(1, Ordering::Relaxed);
                 self.abandon_locked_worker(&mut guard, "write timeout");
@@ -234,7 +252,7 @@ impl Worker {
                 if e.kind() == io::ErrorKind::TimedOut {
                     eprintln!(
                         "wrapperd: worker request opcode={opcode} timed out after {:?}; restarting worker",
-                        self.request_timeout
+                        timeout
                     );
                     self.timeout_count.fetch_add(1, Ordering::Relaxed);
                     self.abandon_locked_worker(&mut guard, "response timeout");
@@ -347,12 +365,14 @@ impl Worker {
     }
 
     fn recover_stuck_worker_or_exit(&self, reason: &'static str) {
+        // Judge staleness against the in-flight request's own budget: a 2FA
+        // login may legitimately settle well past the base timeout.
         let stuck = self
             .state
             .lock()
             .ok()
             .and_then(|s| s.current.clone())
-            .map(|r| r.started.elapsed() >= self.request_timeout)
+            .map(|r| r.started.elapsed() >= self.request_timeout_for(r.opcode))
             .unwrap_or(false);
         if !stuck {
             return;
@@ -402,6 +422,12 @@ impl Drop for RequestTracker<'_> {
         }
     }
 }
+
+/// The daemon settles a 2FA login for up to kLogin2faTimeout (60s,
+/// src/daemon/ipc.cpp) inside a single IPC request. 2FA requests get this
+/// much budget on top of the base so the settle fits with headroom to spare
+/// for writing the request and reading the response.
+const LOGIN_2FA_DAEMON_SETTLE: Duration = Duration::from_secs(60);
 
 fn worker_timeout() -> Duration {
     std::env::var("WRAPPER_WORKER_TIMEOUT_SECS")
@@ -493,6 +519,12 @@ fn read_frame_timeout(stdout: &mut ChildStdout, deadline: Instant) -> io::Result
     let opcode = u16::from_be_bytes([h[12], h[13]]);
     let flags = u16::from_be_bytes([h[14], h[15]]);
     let payload_len = u32::from_be_bytes([h[16], h[17], h[18], h[19]]) as usize;
+    if payload_len > protocol::MAX_IPC_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker response too large",
+        ));
+    }
     let mut payload = vec![0u8; payload_len];
     read_exact_timeout(stdout, &mut payload, deadline)?;
     Ok(protocol::Frame {

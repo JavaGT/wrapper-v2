@@ -3,11 +3,12 @@ mod worker;
 
 use std::collections::HashMap;
 use std::env;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use worker::{Worker, WorkerError};
@@ -17,6 +18,20 @@ const DEFAULT_HTTP_HOST: &str = "0.0.0.0";
 const DEFAULT_HTTP_PORT: u16 = 80;
 const DEFAULT_DECRYPT_HOST: &str = "0.0.0.0";
 const DEFAULT_DECRYPT_PORT: u16 = 10020;
+/// Hard cap applied while reading the request head, so a client streaming
+/// bytes without a blank-line terminator cannot buffer without bound.
+const MAX_HTTP_HEAD_BYTES: usize = 64 * 1024;
+/// Bodies are small JSON login/2FA payloads; larger requests are rejected
+/// before allocation, mirroring the head cap above.
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
+/// Unread request bytes discarded from a rejected connection before it is
+/// dropped, so the error response survives instead of being lost to a TCP
+/// reset.
+const REJECT_DRAIN_BYTES: usize = 256 * 1024;
+/// Upper bound on simultaneous client connections per listener; excess
+/// connections are answered with an error and closed instead of spawning
+/// unbounded per-connection threads.
+const MAX_CONNECTIONS_PER_LISTENER: usize = 128;
 
 fn main() {
     if let Err(e) = run() {
@@ -69,14 +84,24 @@ fn worker_io_error(e: WorkerError) -> io::Error {
 fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     eprintln!("wrapperd: {VERSION} HTTP listening on {addr}");
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                if active.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS_PER_LISTENER {
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    let mut stream = stream;
+                    let _ = write_json(&mut stream, 503, json!({"error":"overloaded"}));
+                    let _ = stream.shutdown(Shutdown::Write);
+                    continue;
+                }
                 let worker = Arc::clone(&worker);
+                let active = Arc::clone(&active);
                 thread::spawn(move || {
                     if let Err(e) = handle_http_connection(stream, worker) {
                         eprintln!("wrapperd: http connection error: {e}");
                     }
+                    active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(e) => eprintln!("wrapperd: http accept error: {e}"),
@@ -85,27 +110,68 @@ fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum HttpHead {
+    Read(Vec<u8>),
+    Eof,
+    TooLarge,
+}
+
+/// Byte index just past the blank line ending the request head, scanning from
+/// `from` so repeated reads need not rescan the whole buffer.
+fn find_head_end(head: &[u8], from: usize) -> Option<usize> {
+    let hay = &head[from..];
+    let crlf = hay
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| from + p + 4);
+    let lf = hay
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|p| from + p + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Reads the request head with a hard byte cap applied on every chunk, so a
+/// client streaming bytes without a blank-line terminator cannot buffer
+/// without bound. The returned buffer may hold body bytes that arrived in the
+/// same read; the caller splits it at the parsed header length.
+fn read_http_head(reader: &mut impl Read) -> io::Result<HttpHead> {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let scanned_from = head.len().saturating_sub(3);
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(HttpHead::Eof);
+        }
+        head.extend_from_slice(&chunk[..n]);
+        if find_head_end(&head, scanned_from).is_some() {
+            return Ok(HttpHead::Read(head));
+        }
+        if head.len() > MAX_HTTP_HEAD_BYTES {
+            return Ok(HttpHead::TooLarge);
+        }
+    }
+}
+
 fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(70)))?;
     stream.set_write_timeout(Some(Duration::from_secs(70)))?;
 
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut head = Vec::new();
-    loop {
-        let mut line = Vec::new();
-        let n = reader.read_until(b'\n', &mut line)?;
-        if n == 0 {
-            return Ok(());
-        }
-        head.extend_from_slice(&line);
-        if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
-            break;
-        }
-        if head.len() > 64 * 1024 {
+    let mut head = match read_http_head(&mut reader)? {
+        HttpHead::Read(head) => head,
+        HttpHead::Eof => return Ok(()),
+        HttpHead::TooLarge => {
             write_json(&mut stream, 431, json!({"error":"headers_too_large"}))?;
+            drain_rejected(&mut stream, REJECT_DRAIN_BYTES, REJECT_DRAIN_BUDGET);
             return Ok(());
         }
-    }
+    };
 
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
@@ -116,6 +182,7 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
         write_json(&mut stream, 400, json!({"error":"bad_request"}))?;
         return Ok(());
     }
+    let head_len = parsed.unwrap();
 
     let method = req.method.unwrap_or("").to_string();
     let target = req.path.unwrap_or("/").to_string();
@@ -133,9 +200,20 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
         }
     }
 
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
+    if http_body_too_large(content_length) {
+        write_json(&mut stream, 413, json!({"error":"payload_too_large"}))?;
+        drain_rejected(&mut stream, REJECT_DRAIN_BYTES, REJECT_DRAIN_BUDGET);
+        return Ok(());
+    }
+    // Bytes past the head may already have arrived with it; they count toward
+    // the body, and the remainder is read from the stream below.
+    let mut body = head.split_off(head_len);
+    if body.len() > content_length {
+        body.truncate(content_length);
+    } else if body.len() < content_length {
+        let mut rest = vec![0u8; content_length - body.len()];
+        reader.read_exact(&mut rest)?;
+        body.extend_from_slice(&rest);
     }
 
     let (path, query) = split_target(&target);
@@ -275,6 +353,35 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
+/// Total time spent draining a rejected connection before it is dropped,
+/// regardless of how much unread request data remains.
+const REJECT_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// A rejected connection is dropped with unread request data still arriving,
+/// which can make the kernel send a TCP reset that discards the error
+/// response just written. Half-close to flush the response, then discard a
+/// bounded amount of the unread request before dropping the socket. Best
+/// effort: gives up after `max_bytes` or `budget`, whichever comes first.
+fn drain_rejected(stream: &mut TcpStream, max_bytes: usize, budget: Duration) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let mut buf = [0u8; 8192];
+    let mut left = max_bytes;
+    let end = Instant::now() + budget;
+    while left > 0 && Instant::now() < end {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => left -= n.min(left),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Whether a declared Content-Length exceeds the accepted request body cap.
+fn http_body_too_large(content_length: usize) -> bool {
+    content_length > MAX_HTTP_BODY_BYTES
+}
+
 fn parse_json_body(body: &[u8]) -> io::Result<Value> {
     serde_json::from_slice(body)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
@@ -316,6 +423,7 @@ fn write_response(
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -334,14 +442,24 @@ fn write_response(
 fn run_decrypt_tcp(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     eprintln!("wrapperd: {VERSION} TCP decrypt listening on {addr}");
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                if active.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS_PER_LISTENER {
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    let mut stream = stream;
+                    let _ = write_decrypt_error(&mut stream, 0, "server busy");
+                    let _ = stream.shutdown(Shutdown::Write);
+                    continue;
+                }
                 let worker = Arc::clone(&worker);
+                let active = Arc::clone(&active);
                 thread::spawn(move || {
                     if let Err(e) = handle_decrypt_client(stream, worker) {
                         eprintln!("wrapperd: decrypt client closed: {e}");
                     }
+                    active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(e) => eprintln!("wrapperd: decrypt accept error: {e}"),
@@ -360,10 +478,31 @@ fn handle_decrypt_client(mut stream: TcpStream, worker: Arc<Worker>) -> io::Resu
         .unwrap_or_else(|_| "unknown".to_string());
     let mut logged_session = false;
     loop {
-        let frame = match protocol::read_decrypt_frame(&mut stream) {
-            Ok(frame) => frame,
+        let header = match protocol::read_decrypt_frame_header(&mut stream) {
+            Ok(header) => header,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
+        };
+        if header.payload_len > protocol::MAX_IPC_PAYLOAD {
+            // The oversized body is still on the wire, so this connection is
+            // out of sync: answer with the usual decrypt error and close.
+            write_decrypt_error(
+                &mut stream,
+                header.request_id,
+                "decrypt frame too large",
+            )?;
+            drain_rejected(&mut stream, REJECT_DRAIN_BYTES, REJECT_DRAIN_BUDGET);
+            return Ok(());
+        }
+        let payload = match protocol::read_decrypt_payload(&mut stream, header.payload_len) {
+            Ok(payload) => payload,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let frame = protocol::DecryptFrame {
+            kind: header.kind,
+            request_id: header.request_id,
+            payload,
         };
         if frame.kind == protocol::DECRYPT_KIND_CLOSE {
             return Ok(());
@@ -435,6 +574,15 @@ fn parse_decrypt_batch_payload(body: &[u8]) -> io::Result<(String, String, Vec<V
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "empty decrypt batch field",
+        ));
+    }
+    // Every sample needs a 4-byte length-table entry plus at least one
+    // payload byte inside this frame; reject counts that can never fit
+    // before sizing the vectors below.
+    if sample_count > body.len().saturating_sub(8 + adam_len + uri_len) / 5 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decrypt batch too large",
         ));
     }
     let table_end =
@@ -529,4 +677,124 @@ fn build_decrypt_samples_payload(samples: &[Vec<u8>]) -> io::Result<Vec<u8>> {
         out.extend_from_slice(sample);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_body_cap_boundary() {
+        assert!(!http_body_too_large(MAX_HTTP_BODY_BYTES));
+        assert!(http_body_too_large(MAX_HTTP_BODY_BYTES + 1));
+    }
+
+    /// Reads everything the caller asks for, counting consumed bytes so tests
+    /// can prove the head read stops early.
+    struct CountingReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = (self.data.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn http_head_read_stops_at_cap_without_terminator() {
+        let mut reader = CountingReader {
+            data: vec![b'x'; MAX_HTTP_HEAD_BYTES * 3],
+            pos: 0,
+        };
+        match read_http_head(&mut reader).unwrap() {
+            HttpHead::TooLarge => {}
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        // One chunk may overread past the cap before the check fires; the
+        // old read_until loop would have consumed the whole stream instead.
+        assert!(reader.pos <= MAX_HTTP_HEAD_BYTES + 4096);
+    }
+
+    #[test]
+    fn http_head_read_returns_head_through_blank_line() {
+        let mut reader: &[u8] = b"POST /login HTTP/1.1\r\nhost: x\r\n\r\n{\"a\":1}";
+        match read_http_head(&mut reader).unwrap() {
+            HttpHead::Read(head) => {
+                assert!(head.starts_with(b"POST /login HTTP/1.1"));
+                assert!(head.windows(4).any(|w| w == b"\r\n\r\n"));
+            }
+            other => panic!("expected Read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_head_read_reports_eof_without_terminator() {
+        let mut reader: &[u8] = b"POST /login HTTP/1.1\r\n";
+        match read_http_head(&mut reader).unwrap() {
+            HttpHead::Eof => {}
+            other => panic!("expected Eof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_rejected_gives_up_after_total_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        // Keep the drain's reads succeeding forever: without the total budget
+        // this loop would pin the drain for ~262,000 s.
+        let writer = thread::spawn(move || {
+            let _ = client.set_write_timeout(Some(Duration::from_millis(200)));
+            for _ in 0..2000 {
+                if client.write_all(&[0x42; 512]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut server = listener.incoming().next().unwrap().unwrap();
+        let started = std::time::Instant::now();
+        drain_rejected(&mut server, REJECT_DRAIN_BYTES, Duration::from_millis(250));
+        let elapsed = started.elapsed();
+        drop(server);
+        writer.join().ok();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain overran its total budget: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn decrypt_batch_rejects_sample_count_that_cannot_fit() {
+        // The header claims a million samples but the frame has no room for
+        // the length table plus one byte per sample.
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1_000_000u32.to_be_bytes());
+        body.extend_from_slice(b"a");
+        body.extend_from_slice(b"u");
+        let err = parse_decrypt_batch_payload(&body).unwrap_err();
+        assert_eq!(err.to_string(), "decrypt batch too large");
+    }
+
+    #[test]
+    fn decrypt_batch_accepts_minimal_sample_count() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&4u32.to_be_bytes());
+        body.extend_from_slice(b"a");
+        body.extend_from_slice(b"u");
+        body.extend_from_slice(b"abcd");
+        let (adam, uri, samples) = parse_decrypt_batch_payload(&body).unwrap();
+        assert_eq!((adam.as_str(), uri.as_str()), ("a", "u"));
+        assert_eq!(samples, vec![b"abcd".to_vec()]);
+    }
 }
