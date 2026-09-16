@@ -519,6 +519,12 @@ fn read_frame_timeout(stdout: &mut ChildStdout, deadline: Instant) -> io::Result
     let opcode = u16::from_be_bytes([h[12], h[13]]);
     let flags = u16::from_be_bytes([h[14], h[15]]);
     let payload_len = u32::from_be_bytes([h[16], h[17], h[18], h[19]]) as usize;
+    if payload_len > protocol::MAX_IPC_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker response too large",
+        ));
+    }
     let mut payload = vec![0u8; payload_len];
     read_exact_timeout(stdout, &mut payload, deadline)?;
     Ok(protocol::Frame {

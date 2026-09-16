@@ -452,7 +452,7 @@ fn handle_decrypt_client(mut stream: TcpStream, worker: Arc<Worker>) -> io::Resu
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        if header.payload_len > protocol::MAX_DECRYPT_PAYLOAD {
+        if header.payload_len > protocol::MAX_IPC_PAYLOAD {
             // The oversized body is still on the wire, so this connection is
             // out of sync: answer with the usual decrypt error and close.
             write_decrypt_error(

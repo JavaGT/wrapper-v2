@@ -57,10 +57,10 @@ pub fn write_frame(mut w: impl Write, frame: &Frame) -> io::Result<()> {
     w.flush()
 }
 
-/// Largest decrypt frame payload accepted on either side of the IPC boundary,
-/// mirroring `kMaxPayload` in src/daemon/ipc.cpp so both peers reject the same
-/// frames.
-pub const MAX_DECRYPT_PAYLOAD: usize = 256 * 1024 * 1024;
+/// Largest frame payload accepted on either side of the IPC boundary,
+/// mirroring `kMaxPayload` in src/daemon/ipc.cpp so both peers reject the
+/// same frames.
+pub const MAX_IPC_PAYLOAD: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DecryptFrameHeader {
@@ -96,7 +96,7 @@ pub fn read_decrypt_frame_header(mut r: impl Read) -> io::Result<DecryptFrameHea
 /// Reads a decrypt frame body, rejecting oversized lengths before any
 /// allocation.
 pub fn read_decrypt_payload(mut r: impl Read, payload_len: usize) -> io::Result<Vec<u8>> {
-    if payload_len > MAX_DECRYPT_PAYLOAD {
+    if payload_len > MAX_IPC_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "decrypt frame too large",
@@ -187,7 +187,7 @@ pub fn decrypt_batch_payload(adam: &str, uri: &str, samples: &[Vec<u8>]) -> io::
             io::Error::new(io::ErrorKind::InvalidInput, "decrypt payload too large")
         })?;
     }
-    if size > MAX_DECRYPT_PAYLOAD {
+    if size > MAX_IPC_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "decrypt payload too large",
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn oversize_decrypt_payload_is_rejected_before_allocation() {
-        let err = read_decrypt_payload(io::empty(), MAX_DECRYPT_PAYLOAD + 1).unwrap_err();
+        let err = read_decrypt_payload(io::empty(), MAX_IPC_PAYLOAD + 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "decrypt frame too large");
     }
