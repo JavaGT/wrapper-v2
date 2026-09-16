@@ -17,6 +17,9 @@ const DEFAULT_HTTP_HOST: &str = "0.0.0.0";
 const DEFAULT_HTTP_PORT: u16 = 80;
 const DEFAULT_DECRYPT_HOST: &str = "0.0.0.0";
 const DEFAULT_DECRYPT_PORT: u16 = 10020;
+/// Bodies are small JSON login/2FA payloads; larger requests are rejected
+/// before allocation, mirroring the 64 KiB header cap enforced below.
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 
 fn main() {
     if let Err(e) = run() {
@@ -133,6 +136,10 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
         }
     }
 
+    if content_length > MAX_HTTP_BODY_BYTES {
+        write_json(&mut stream, 413, json!({"error":"payload_too_large"}))?;
+        return Ok(());
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
@@ -316,6 +323,7 @@ fn write_response(
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -360,10 +368,30 @@ fn handle_decrypt_client(mut stream: TcpStream, worker: Arc<Worker>) -> io::Resu
         .unwrap_or_else(|_| "unknown".to_string());
     let mut logged_session = false;
     loop {
-        let frame = match protocol::read_decrypt_frame(&mut stream) {
-            Ok(frame) => frame,
+        let header = match protocol::read_decrypt_frame_header(&mut stream) {
+            Ok(header) => header,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
+        };
+        if header.payload_len > protocol::MAX_DECRYPT_PAYLOAD {
+            // The oversized body is still on the wire, so this connection is
+            // out of sync: answer with the usual decrypt error and close.
+            write_decrypt_error(
+                &mut stream,
+                header.request_id,
+                "decrypt frame too large",
+            )?;
+            return Ok(());
+        }
+        let payload = match protocol::read_decrypt_payload(&mut stream, header.payload_len) {
+            Ok(payload) => payload,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let frame = protocol::DecryptFrame {
+            kind: header.kind,
+            request_id: header.request_id,
+            payload,
         };
         if frame.kind == protocol::DECRYPT_KIND_CLOSE {
             return Ok(());

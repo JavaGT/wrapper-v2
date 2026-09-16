@@ -57,7 +57,19 @@ pub fn write_frame(mut w: impl Write, frame: &Frame) -> io::Result<()> {
     w.flush()
 }
 
-pub fn read_decrypt_frame(mut r: impl Read) -> io::Result<DecryptFrame> {
+/// Largest decrypt frame payload accepted on either side of the IPC boundary,
+/// mirroring `kMaxPayload` in src/daemon/ipc.cpp so both peers reject the same
+/// frames.
+pub const MAX_DECRYPT_PAYLOAD: usize = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct DecryptFrameHeader {
+    pub kind: u16,
+    pub request_id: u32,
+    pub payload_len: usize,
+}
+
+pub fn read_decrypt_frame_header(mut r: impl Read) -> io::Result<DecryptFrameHeader> {
     let mut h = [0u8; DECRYPT_HEADER_LEN];
     r.read_exact(&mut h)?;
     let magic = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
@@ -74,16 +86,25 @@ pub fn read_decrypt_frame(mut r: impl Read) -> io::Result<DecryptFrame> {
             "bad decrypt version",
         ));
     }
-    let kind = u16::from_be_bytes([h[6], h[7]]);
-    let request_id = u32::from_be_bytes([h[8], h[9], h[10], h[11]]);
-    let payload_len = u32::from_be_bytes([h[12], h[13], h[14], h[15]]) as usize;
+    Ok(DecryptFrameHeader {
+        kind: u16::from_be_bytes([h[6], h[7]]),
+        request_id: u32::from_be_bytes([h[8], h[9], h[10], h[11]]),
+        payload_len: u32::from_be_bytes([h[12], h[13], h[14], h[15]]) as usize,
+    })
+}
+
+/// Reads a decrypt frame body, rejecting oversized lengths before any
+/// allocation.
+pub fn read_decrypt_payload(mut r: impl Read, payload_len: usize) -> io::Result<Vec<u8>> {
+    if payload_len > MAX_DECRYPT_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decrypt frame too large",
+        ));
+    }
     let mut payload = vec![0u8; payload_len];
     r.read_exact(&mut payload)?;
-    Ok(DecryptFrame {
-        kind,
-        request_id,
-        payload,
-    })
+    Ok(payload)
 }
 
 pub fn write_decrypt_frame(mut w: impl Write, frame: &DecryptFrame) -> io::Result<()> {
@@ -165,6 +186,12 @@ pub fn decrypt_batch_payload(adam: &str, uri: &str, samples: &[Vec<u8>]) -> io::
         size = size.checked_add(sample.len()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "decrypt payload too large")
         })?;
+    }
+    if size > MAX_DECRYPT_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "decrypt payload too large",
+        ));
     }
     let mut out = Vec::with_capacity(size);
     out.extend_from_slice(&(adam.len() as u16).to_be_bytes());
@@ -260,6 +287,27 @@ mod tests {
         bytes[4..6].copy_from_slice(&VERSION.to_be_bytes());
         let err = read_frame(bytes.as_slice()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decrypt_frame_header_parses_without_reading_body() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&DECRYPT_MAGIC.to_be_bytes());
+        bytes.extend_from_slice(&DECRYPT_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&DECRYPT_KIND_BATCH.to_be_bytes());
+        bytes.extend_from_slice(&42u32.to_be_bytes());
+        bytes.extend_from_slice(&5u32.to_be_bytes());
+        let header = read_decrypt_frame_header(bytes.as_slice()).unwrap();
+        assert_eq!(header.kind, DECRYPT_KIND_BATCH);
+        assert_eq!(header.request_id, 42);
+        assert_eq!(header.payload_len, 5);
+    }
+
+    #[test]
+    fn oversize_decrypt_payload_is_rejected_before_allocation() {
+        let err = read_decrypt_payload(io::empty(), MAX_DECRYPT_PAYLOAD + 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "decrypt frame too large");
     }
 
     #[test]
