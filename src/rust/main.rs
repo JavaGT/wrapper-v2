@@ -8,7 +8,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use worker::{Worker, WorkerError};
@@ -92,6 +92,7 @@ fn run_http(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
                     active.fetch_sub(1, Ordering::Relaxed);
                     let mut stream = stream;
                     let _ = write_json(&mut stream, 503, json!({"error":"overloaded"}));
+                    let _ = stream.shutdown(Shutdown::Write);
                     continue;
                 }
                 let worker = Arc::clone(&worker);
@@ -167,7 +168,7 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
         HttpHead::Eof => return Ok(()),
         HttpHead::TooLarge => {
             write_json(&mut stream, 431, json!({"error":"headers_too_large"}))?;
-            drain_rejected(&mut stream, REJECT_DRAIN_BYTES);
+            drain_rejected(&mut stream, REJECT_DRAIN_BYTES, REJECT_DRAIN_BUDGET);
             return Ok(());
         }
     };
@@ -201,7 +202,7 @@ fn handle_http_connection(mut stream: TcpStream, worker: Arc<Worker>) -> io::Res
 
     if http_body_too_large(content_length) {
         write_json(&mut stream, 413, json!({"error":"payload_too_large"}))?;
-        drain_rejected(&mut stream, REJECT_DRAIN_BYTES);
+        drain_rejected(&mut stream, REJECT_DRAIN_BYTES, REJECT_DRAIN_BUDGET);
         return Ok(());
     }
     // Bytes past the head may already have arrived with it; they count toward
@@ -352,16 +353,22 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
+/// Total time spent draining a rejected connection before it is dropped,
+/// regardless of how much unread request data remains.
+const REJECT_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
 /// A rejected connection is dropped with unread request data still arriving,
 /// which can make the kernel send a TCP reset that discards the error
 /// response just written. Half-close to flush the response, then discard a
-/// bounded amount of the unread request before dropping the socket.
-fn drain_rejected(stream: &mut TcpStream, max_bytes: usize) {
+/// bounded amount of the unread request before dropping the socket. Best
+/// effort: gives up after `max_bytes` or `budget`, whichever comes first.
+fn drain_rejected(stream: &mut TcpStream, max_bytes: usize, budget: Duration) {
     let _ = stream.shutdown(Shutdown::Write);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let mut buf = [0u8; 8192];
     let mut left = max_bytes;
-    while left > 0 {
+    let end = Instant::now() + budget;
+    while left > 0 && Instant::now() < end {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => left -= n.min(left),
@@ -443,6 +450,7 @@ fn run_decrypt_tcp(addr: &str, worker: Arc<Worker>) -> io::Result<()> {
                     active.fetch_sub(1, Ordering::Relaxed);
                     let mut stream = stream;
                     let _ = write_decrypt_error(&mut stream, 0, "server busy");
+                    let _ = stream.shutdown(Shutdown::Write);
                     continue;
                 }
                 let worker = Arc::clone(&worker);
@@ -483,7 +491,7 @@ fn handle_decrypt_client(mut stream: TcpStream, worker: Arc<Worker>) -> io::Resu
                 header.request_id,
                 "decrypt frame too large",
             )?;
-            drain_rejected(&mut stream, REJECT_DRAIN_BYTES);
+            drain_rejected(&mut stream, REJECT_DRAIN_BYTES, REJECT_DRAIN_BUDGET);
             return Ok(());
         }
         let payload = match protocol::read_decrypt_payload(&mut stream, header.payload_len) {
@@ -731,6 +739,34 @@ mod tests {
             HttpHead::Eof => {}
             other => panic!("expected Eof, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn drain_rejected_gives_up_after_total_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        // Keep the drain's reads succeeding forever: without the total budget
+        // this loop would pin the drain for ~262,000 s.
+        let writer = thread::spawn(move || {
+            let _ = client.set_write_timeout(Some(Duration::from_millis(200)));
+            for _ in 0..2000 {
+                if client.write_all(&[0x42; 512]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut server = listener.incoming().next().unwrap().unwrap();
+        let started = std::time::Instant::now();
+        drain_rejected(&mut server, REJECT_DRAIN_BYTES, Duration::from_millis(250));
+        let elapsed = started.elapsed();
+        drop(server);
+        writer.join().ok();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain overran its total budget: {elapsed:?}"
+        );
     }
 
     #[test]
