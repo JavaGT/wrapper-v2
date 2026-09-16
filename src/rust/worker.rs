@@ -174,9 +174,22 @@ impl Worker {
         ))
     }
 
+    /// Supervisor budget for one IPC request. Must strictly exceed the
+    /// daemon's own wait for the opcode (see kLoginTimeout and
+    /// kLogin2faTimeout in src/daemon/ipc.cpp) plus a possible full-budget
+    /// wait for the worker lock, so a slow settle is answered instead of
+    /// timing out and SIGKILLing the worker mid-flow.
+    fn request_timeout_for(&self, opcode: u16) -> Duration {
+        match opcode {
+            protocol::OP_LOGIN_2FA => self.request_timeout + LOGIN_2FA_DAEMON_SETTLE,
+            _ => self.request_timeout,
+        }
+    }
+
     fn request(&self, opcode: u16, payload: Vec<u8>) -> Result<protocol::Frame, WorkerError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let deadline = Instant::now() + self.request_timeout;
+        let timeout = self.request_timeout_for(opcode);
+        let deadline = Instant::now() + timeout;
         let wait_tracker = self.track_wait();
         let mut guard = match lock_worker_timeout(&self.proc, deadline) {
             Ok(g) => g,
@@ -184,7 +197,7 @@ impl Worker {
                 if e.to_string().contains("timed out") {
                     eprintln!(
                         "wrapperd: worker request opcode={opcode} timed out waiting for worker after {:?}",
-                        self.request_timeout
+                        timeout
                     );
                     self.timeout_count.fetch_add(1, Ordering::Relaxed);
                     self.recover_stuck_worker_or_exit("lock wait timeout");
@@ -218,7 +231,7 @@ impl Worker {
             if e.kind() == io::ErrorKind::TimedOut {
                 eprintln!(
                     "wrapperd: worker request opcode={opcode} timed out while writing after {:?}; restarting worker",
-                    self.request_timeout
+                    timeout
                 );
                 self.timeout_count.fetch_add(1, Ordering::Relaxed);
                 self.abandon_locked_worker(&mut guard, "write timeout");
@@ -234,7 +247,7 @@ impl Worker {
                 if e.kind() == io::ErrorKind::TimedOut {
                     eprintln!(
                         "wrapperd: worker request opcode={opcode} timed out after {:?}; restarting worker",
-                        self.request_timeout
+                        timeout
                     );
                     self.timeout_count.fetch_add(1, Ordering::Relaxed);
                     self.abandon_locked_worker(&mut guard, "response timeout");
@@ -347,12 +360,14 @@ impl Worker {
     }
 
     fn recover_stuck_worker_or_exit(&self, reason: &'static str) {
+        // Judge staleness against the in-flight request's own budget: a 2FA
+        // login may legitimately settle well past the base timeout.
         let stuck = self
             .state
             .lock()
             .ok()
             .and_then(|s| s.current.clone())
-            .map(|r| r.started.elapsed() >= self.request_timeout)
+            .map(|r| r.started.elapsed() >= self.request_timeout_for(r.opcode))
             .unwrap_or(false);
         if !stuck {
             return;
@@ -402,6 +417,12 @@ impl Drop for RequestTracker<'_> {
         }
     }
 }
+
+/// The daemon settles a 2FA login for up to kLogin2faTimeout (60s,
+/// src/daemon/ipc.cpp) inside a single IPC request. 2FA requests get this
+/// much extra supervisor budget so the daemon wait always fits even after a
+/// full base-budget wait for the worker lock.
+const LOGIN_2FA_DAEMON_SETTLE: Duration = Duration::from_secs(60);
 
 fn worker_timeout() -> Duration {
     std::env::var("WRAPPER_WORKER_TIMEOUT_SECS")
