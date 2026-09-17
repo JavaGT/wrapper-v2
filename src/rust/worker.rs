@@ -183,11 +183,10 @@ impl Worker {
             Err(e) => {
                 if e.to_string().contains("timed out") {
                     eprintln!(
-                        "wrapperd: worker request opcode={opcode} timed out waiting for worker after {:?}",
+                        "wrapperd: worker request opcode={opcode} gave up waiting for the worker mutex after {:?}; the in-flight holder owns recovery",
                         self.request_timeout
                     );
                     self.timeout_count.fetch_add(1, Ordering::Relaxed);
-                    self.recover_stuck_worker_or_exit("lock wait timeout");
                 }
                 self.record_error(e.to_string());
                 return Err(e);
@@ -344,33 +343,6 @@ impl Worker {
         self.pid.store(0, Ordering::Relaxed);
         cleanup_worker(old, reason);
         self.record_restart(reason);
-    }
-
-    fn recover_stuck_worker_or_exit(&self, reason: &'static str) {
-        let stuck = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|s| s.current.clone())
-            .map(|r| r.started.elapsed() >= self.request_timeout)
-            .unwrap_or(false);
-        if !stuck {
-            return;
-        }
-        let pid = self.pid.swap(0, Ordering::Relaxed);
-        if pid == 0 {
-            eprintln!(
-                "wrapperd: fatal: worker request is stale, but no worker pid is available; exiting for container restart"
-            );
-            std::process::exit(70);
-        }
-        self.record_restart(reason);
-        thread::spawn(move || {
-            eprintln!("wrapperd: killing stuck worker pid={pid}: {reason}");
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        });
     }
 }
 
@@ -580,10 +552,18 @@ fn wait_fd(fd: i32, events: i16, closed_message: &str, deadline: Instant) -> io:
         pfd.revents = 0;
         let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if n > 0 {
-            if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, closed_message));
+            if pfd.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "worker ipc fd is invalid",
+                ));
             }
-            return Ok(());
+            if pfd.revents & events != 0 {
+                // POLLHUP/POLLERR may be co-set with the requested event; the
+                // buffered bytes are still readable (read() reports EOF after).
+                return Ok(());
+            }
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, closed_message));
         }
         if n == 0 {
             return Err(io::Error::new(
@@ -632,4 +612,42 @@ fn parse_worker_response(frame: protocol::Frame) -> Result<WorkerResponse, Worke
         body,
         restart_worker,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::FromRawFd;
+
+    /// A complete response written just before the worker died arrives as
+    /// POLLIN co-set with POLLHUP; the buffered bytes must be readable and
+    /// EOF must only surface after the drain.
+    #[test]
+    fn poll_keeps_buffered_bytes_readable_after_hup() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        const PAYLOAD: &[u8] = b"buffered response bytes";
+        assert_eq!(
+            unsafe { libc::write(wr, PAYLOAD.as_ptr().cast(), PAYLOAD.len()) },
+            PAYLOAD.len() as isize,
+        );
+        let _ = unsafe { libc::close(wr) };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        wait_readable(rd, deadline)
+            .expect("POLLIN co-set with POLLHUP must stay readable");
+
+        let mut file =
+            std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(rd) });
+        let mut buf = [0u8; PAYLOAD.len()];
+        read_exact_timeout(&mut file, &mut buf, deadline)
+            .expect("buffered bytes must be drained before EOF");
+        assert_eq!(&buf, PAYLOAD);
+
+        let mut eof_buf = [0u8; 1];
+        let err = read_exact_timeout(&mut file, &mut eof_buf, deadline)
+            .expect_err("EOF must surface only after the drain");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
 }
