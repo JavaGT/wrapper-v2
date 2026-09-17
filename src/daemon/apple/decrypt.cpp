@@ -175,19 +175,32 @@ DecryptResult decrypt_samples(const Loader& loader,
         return attempt;
     };
 
-    std::string first_error;
-    try {
-        out = decrypt_once(true, ciphertexts, &first_error);
-    } catch (const std::exception& e) {
-        first_error = e.what();
-    } catch (...) {
-        first_error = "native FPS decrypt threw an unknown exception";
-    }
-    if (out.ok) return out;
+    auto attempt_decrypt = [&](bool allow_cache, std::string* error) {
+        try {
+            out = decrypt_once(allow_cache, ciphertexts, error);
+        } catch (const std::exception& e) {
+            *error = e.what();
+        } catch (...) {
+            *error = "native FPS decrypt threw an unknown exception";
+        }
+        return out.ok;
+    };
 
+    std::string first_error;
+    if (attempt_decrypt(true, &first_error)) return out;
+
+    // A batch can fail because the cached kd context went stale (re-lease,
+    // worker reuse). decrypt_once takes the ciphertexts by value, so the
+    // caller's buffer is untouched and one retry with a freshly acquired
+    // context is safe; only a second failure escalates to a worker restart.
     erase_cached_kd(adam_id, key_uri);
+
+    std::string second_error;
+    if (attempt_decrypt(false, &second_error)) return out;
+
     out.error = "FPS decrypt failed";
     if (!first_error.empty()) out.error += " (first: " + first_error + ")";
+    if (!second_error.empty()) out.error += " (retry: " + second_error + ")";
     return out;
 }
 
