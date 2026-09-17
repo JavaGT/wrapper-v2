@@ -198,6 +198,10 @@ DecryptResult decrypt_samples(const Loader& loader,
     std::string second_error;
     if (attempt_decrypt(false, &second_error)) return out;
 
+    // The retry acquired and cached a fresh context that also failed; do not
+    // leave a known-bad kd in the cache for the next batch.
+    erase_cached_kd(adam_id, key_uri);
+
     out.error = "FPS decrypt failed";
     if (!first_error.empty()) out.error += " (first: " + first_error + ")";
     if (!second_error.empty()) out.error += " (retry: " + second_error + ")";
